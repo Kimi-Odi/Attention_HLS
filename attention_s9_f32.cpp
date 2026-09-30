@@ -1,0 +1,100 @@
+// =============================================================
+//  Solution #9 : factor=32 中間點  (補 S7 與 S8 之間的前緣空檔)
+//
+//  S7 (factor=16): QKt II=4, DSP=139, delay=0.134s, ATP=5240 (低 ATP)
+//  S8 (factor=64): QKt II=1, DSP=523, delay=0.101s, ATP=8700 (低延遲)
+//  兩者之間有空檔。S9 用 factor=32 (QKt II=2 預期), 應落在中間。
+//
+//  與 S8 唯一差別: K cyclic factor 從 64 改成 32。
+//  softmax (unroll-by-4) + PV (完全展開) 完全相同。
+//
+//  目的: 在 ATP-delay 空間補一個「中延遲、中面積」的前緣點,
+//    讓使用者有更細緻的設計選擇 (delay/area 的中間平衡)。
+//
+//  !! K cyclic factor 數字必須是字面常數 (HLS 不吃巨集) !!
+// =============================================================
+#include "attention.h"
+
+#define QK_BANKS 32   // K partition 寬度 (S7=16, S8=64, S9=32 中間)
+
+void attention_head(
+    data_t Q[N][DK],
+    data_t K[N][DK],
+    data_t V[N][DK],
+    data_t O[N][DK])
+{
+    #pragma HLS ARRAY_PARTITION variable=Q complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=K cyclic factor=32 dim=2
+    #pragma HLS ARRAY_PARTITION variable=V complete dim=2
+
+    data_t S_row[N];
+
+    Row_Loop: for (int i = 0; i < N; i++) {
+
+        // ===== 1) S = Q.K^T : 內層展開 QK_BANKS =====
+        // DK/QK_BANKS = 128/32 = 4 組
+        QKt_Loop: for (int j = 0; j < N; j++) {
+            #pragma HLS PIPELINE II=1
+            data_t group_sum = (data_t)0;
+            Outer_K: for (int kb = 0; kb < DK; kb += QK_BANKS) {
+                data_t psum = (data_t)0;
+                Inner_K: for (int kk = 0; kk < QK_BANKS; kk++) {
+                    #pragma HLS UNROLL
+                    psum += Q[i][kb+kk] * K[j][kb+kk];
+                }
+                group_sum += psum;
+            }
+            S_row[j] = (data_t)(group_sum * INV_SQRT_DK);
+        }
+
+        // ===== 2a) Max =====
+        data_t max_v = S_row[0];
+        Max_Loop: for (int j = 1; j < N; j++) {
+            #pragma HLS PIPELINE II=1
+            if (S_row[j] > max_v) max_v = S_row[j];
+        }
+
+        // ===== 2b) Exp + Sum : softmax unroll-by-4 (同 S6c/S7/S8) =====
+        data_t denom0 = (data_t)0, denom1 = (data_t)0;
+        data_t denom2 = (data_t)0, denom3 = (data_t)0;
+        Exp_Loop: for (int j = 0; j < N; j += 4) {
+            #pragma HLS PIPELINE II=1
+            data_t e0 = hls::exp((data_t)(S_row[j]   - max_v));
+            data_t e1 = hls::exp((data_t)(S_row[j+1] - max_v));
+            data_t e2 = hls::exp((data_t)(S_row[j+2] - max_v));
+            data_t e3 = hls::exp((data_t)(S_row[j+3] - max_v));
+            S_row[j]   = e0;  S_row[j+1] = e1;
+            S_row[j+2] = e2;  S_row[j+3] = e3;
+            denom0 += e0;  denom1 += e1;
+            denom2 += e2;  denom3 += e3;
+        }
+        data_t denom = (denom0 + denom1) + (denom2 + denom3);
+
+        // ===== 2c) Norm =====
+        data_t inv_denom = (data_t)((data_t)1 / denom);
+        Norm_Loop: for (int j = 0; j < N; j++) {
+            #pragma HLS PIPELINE II=1
+            S_row[j] = S_row[j] * inv_denom;
+        }
+
+        // ===== 3) O = P.V (同 S6c/S7/S8, 完全展開) =====
+        data_t acc[DK];
+        #pragma HLS ARRAY_PARTITION variable=acc complete dim=1
+        Init_Acc: for (int d = 0; d < DK; d++) {
+            #pragma HLS UNROLL
+            acc[d] = (data_t)0;
+        }
+        PV_Loop: for (int j = 0; j < N; j++) {
+            #pragma HLS PIPELINE II=1
+            data_t p = S_row[j];
+            MAC_D: for (int d = 0; d < DK; d++) {
+                #pragma HLS UNROLL
+                acc[d] += p * V[j][d];
+            }
+        }
+        Write_O: for (int d = 0; d < DK; d++) {
+            #pragma HLS UNROLL
+            O[i][d] = (data_t)acc[d];
+        }
+    }
+}

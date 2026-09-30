@@ -1,0 +1,24 @@
+# Generated EDA outputs and local state
+.Xil/
+*.cache/
+*.runs/
+*.sim/
+*.hw/
+*.ip_user_files/
+build/
+runs/
+__pycache__/
+*.pyc
+*.log
+*.jou
+*.wdb
+*.vcd
+*.vvp
+*.dcp
+*.bit
+*.bin
+*.zip
+.DS_Store
+Thumbs.db
+.env
+.env.*
